@@ -1,4 +1,5 @@
 const axios = require('axios');
+const axiosRetry = require('axios-retry');
 const {StatusCodes} = require('http-status-codes');
 
 const { BookingRepository } = require('../repositories');
@@ -7,6 +8,8 @@ const db = require('../models');
 const AppError = require('../utils/errors/app-error');
 const {Enums} = require('../utils/common');
 const { BOOKED, CANCELLED } = Enums.BOOKING_STATUS;
+
+axiosRetry(axios, { retries: 3, retryDelay: axiosRetry.exponentialDelay });
 
 const bookingRepository = new BookingRepository();
 
@@ -32,7 +35,6 @@ async function createBooking(data) {
         await transaction.rollback();
         throw error;
     }
-    
 }
 
 
@@ -43,10 +45,12 @@ async function makePayment(data) {
         if(bookingDetails.status == CANCELLED) {
             throw new AppError('The booking has expired', StatusCodes.BAD_REQUEST);
         }
-        console.log(bookingDetails);
         const bookingTime = new Date(bookingDetails.createdAt);
         const currentTime = new Date();
         if(currentTime - bookingTime > 300000) {
+            //  rollback current transaction before calling cancelBooking
+            // to avoid nested/conflicting transactions
+            await transaction.rollback();
             await cancelBooking(data.bookingId);
             throw new AppError('The booking has expired', StatusCodes.BAD_REQUEST);
         }
@@ -56,17 +60,26 @@ async function makePayment(data) {
         if(bookingDetails.userId != data.userId) {
             throw new AppError('The user corresponding to the booking doesnt match', StatusCodes.BAD_REQUEST);
         }
-        // we assume here that payment is successful
         await bookingRepository.update(data.bookingId, {status: BOOKED}, transaction);
-        Queue.sendData({
-            recepientEmail: 'cs191297@gmail.com',
-            subject: 'Flight booked',
-            text: `Booking successfully done for the booking ${data.bookingId}`
-        });
         await transaction.commit();
+
+        //  moved Queue.sendData after commit so a queue failure
+        // doesn't affect the committed booking
+        try {
+            Queue.sendData({
+                recepientEmail: 'cs191297@gmail.com',
+                subject: 'Flight booked',
+                text: `Booking successfully done for the booking ${data.bookingId}`
+            });
+        } catch(queueError) {
+            console.error('Queue notification failed for booking:', data.bookingId, queueError);
+        }
         
     } catch(error) {
-        await transaction.rollback();
+        // only rollback if transaction hasn't already been rolled back
+        if(!transaction.finished) {
+            await transaction.rollback();
+        }
         throw error;
     }
 }
@@ -75,7 +88,6 @@ async function cancelBooking(bookingId) {
     const transaction = await db.sequelize.transaction();
     try {
         const bookingDetails = await bookingRepository.get(bookingId, transaction);
-        console.log(bookingDetails);
         if(bookingDetails.status == CANCELLED) {
             await transaction.commit();
             return true;
@@ -95,11 +107,18 @@ async function cancelBooking(bookingId) {
 
 async function cancelOldBookings() {
     try {
-        console.log("Inside service")
-        const time = new Date( Date.now() - 1000 * 300 ); // time 5 mins ago
-        const response = await bookingRepository.cancelOldBookings(time);
+        const time = new Date( Date.now() - 1000 * 300 );
+        const bookings = await bookingRepository.cancelOldBookings(time);
+
+        //  restore seats for each cancelled booking
+        for(const booking of bookings) {
+            await axios.patch(`${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${booking.flightId}/seats`, {
+                seats: booking.noofSeats,
+                dec: 0
+            });
+        }
         
-        return response;
+        return bookings;
     } catch(error) {
         console.log(error);
     }
@@ -108,5 +127,6 @@ async function cancelOldBookings() {
 module.exports = {
     createBooking,
     makePayment,
+    cancelBooking,  
     cancelOldBookings
 }
