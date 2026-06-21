@@ -1,6 +1,7 @@
 const { StatusCodes } = require('http-status-codes');
 const { BookingService } = require('../services');
 const { SuccessResponse, ErrorResponse } = require('../utils/common');
+const redisclient = require('../config/redis');
 
 const inMemDb = {};
 
@@ -32,17 +33,25 @@ async function makePayment(req, res) {
                 .status(StatusCodes.BAD_REQUEST)
                 .json({message: 'idempotency key missing'});
         }
-        if(inMemDb[idempotencyKey]) {
+       const chacheresponse=await redisclient.get(idempotencyKey);
+       if(chacheresponse) {
             return res
                 .status(StatusCodes.BAD_REQUEST)
-                .json({message: 'Cannot retry on a successful payment'});
-        } 
+                .json({message: 'Duplicate request'});
+       }
         const response = await BookingService.makePayment({
             totalCost: req.body.totalCost,
             userId: req.body.userId,
             bookingId: req.body.bookingId
         });
-        inMemDb[idempotencyKey] = idempotencyKey;
+        
+           await redisClient.set(
+            idempotencyKey,
+            JSON.stringify(SuccessResponse),
+            {
+                EX: 60 * 60 * 24
+            }
+        );
         SuccessResponse.data = response;
         return res
                 .status(StatusCodes.OK)
